@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from engine.decision_engine import DecisionEngine
 from engine.models import Direction, MarketContext, SetupState
+from engine.notification_tracker import NotificationTracker
 from notifications.telegram_sender import TelegramSender
 
 
@@ -21,6 +22,7 @@ app = FastAPI(
 )
 
 decision_engine = DecisionEngine()
+notification_tracker = NotificationTracker()
 
 
 class TradingViewPayload(BaseModel):
@@ -84,7 +86,10 @@ def format_decision_message(
     """Crea il report Telegram completo."""
 
     if decision.state == SetupState.CONFIRMED:
-        title = f"🔴 <b>{context.asset} — ENTRA {context.direction.value} ORA</b>"
+        title = (
+            f"🔴 <b>{context.asset} — "
+            f"ENTRA {context.direction.value} ORA</b>"
+        )
     elif decision.state == SetupState.ALMOST_READY:
         title = f"🟠 <b>{context.asset} — QUASI PRONTA</b>"
     else:
@@ -100,7 +105,8 @@ def format_decision_message(
 
     if decision.risk_reward is not None:
         lines.append(
-            f"<b>Rischio/Rendimento:</b> 1:{decision.risk_reward:.2f}"
+            f"<b>Rischio/Rendimento:</b> "
+            f"1:{decision.risk_reward:.2f}"
         )
 
     if decision.entry is not None:
@@ -117,7 +123,10 @@ def format_decision_message(
 
     if decision.reasons:
         lines.extend(["", "<b>Motivazione:</b>"])
-        lines.extend(f"✅ {reason}" for reason in decision.reasons)
+        lines.extend(
+            f"✅ {reason}"
+            for reason in decision.reasons
+        )
 
     if decision.optional_confirmations:
         lines.extend(["", "<b>Conferme aggiuntive:</b>"])
@@ -181,19 +190,36 @@ def tradingview_webhook(payload: TradingViewPayload) -> dict:
 
     decision = decision_engine.evaluate(context)
 
-    # Nessuna notifica per semplice monitoraggio.
-    if decision.state in {
+    notifiable_states = {
         SetupState.ALMOST_READY,
         SetupState.CONFIRMED,
-    }:
-        message = format_decision_message(context, decision)
-        TelegramSender().send_message(message)
+    }
+
+    notification_sent = False
+    duplicate_blocked = False
+
+    if decision.state in notifiable_states:
+        should_notify = notification_tracker.should_notify(
+            asset=context.asset,
+            direction=context.direction.value,
+            state=decision.state,
+        )
+
+        if should_notify:
+            message = format_decision_message(
+                context=context,
+                decision=decision,
+            )
+            TelegramSender().send_message(message)
+            notification_sent = True
+        else:
+            duplicate_blocked = True
 
     return {
         "ok": True,
         "asset": decision.asset,
         "state": decision.state.value,
         "score": decision.score,
-        "notification_sent": decision.state
-        in {SetupState.ALMOST_READY, SetupState.CONFIRMED},
+        "notification_sent": notification_sent,
+        "duplicate_blocked": duplicate_blocked,
     }
