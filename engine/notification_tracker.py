@@ -41,12 +41,14 @@ class NotificationTracker:
         state: SetupState,
     ) -> bool:
         """
-        Restituisce True soltanto quando lo stato è nuovo.
+        Restituisce True soltanto quando lo stato è diverso
+        dall'ultimo stato già notificato.
 
         Esempio:
-        QUASI PRONTA → notifica
-        QUASI PRONTA di nuovo → nessuna notifica
-        CONFERMATA → nuova notifica
+        ALMOST_READY → notifica
+        ALMOST_READY → bloccata
+        CONFIRMED → notifica
+        CONFIRMED → bloccata
         """
 
         setup_key = self._build_key(asset, direction)
@@ -62,6 +64,44 @@ class NotificationTracker:
         self._save_state(
             setup_key=setup_key,
             state=state,
+        )
+
+        return True
+
+    def invalidate_setup(
+        self,
+        asset: str,
+        direction: str,
+    ) -> bool:
+        """
+        Invalida un setup attivo.
+
+        Restituisce True soltanto se esisteva un setup precedentemente
+        notificato come ALMOST_READY oppure CONFIRMED.
+
+        Lo stato INVALIDATED funziona come confine tra il vecchio setup
+        e quello successivo:
+
+        - impedisce notifiche INVALIDATED duplicate;
+        - permette a un nuovo ALMOST_READY o CONFIRMED di essere notificato.
+        """
+
+        previous_state = self.get_last_state(
+            asset=asset,
+            direction=direction,
+        )
+
+        active_states = {
+            SetupState.ALMOST_READY.value,
+            SetupState.CONFIRMED.value,
+        }
+
+        if previous_state not in active_states:
+            return False
+
+        self._save_state(
+            setup_key=self._build_key(asset, direction),
+            state=SetupState.INVALIDATED,
         )
 
         return True
@@ -93,7 +133,7 @@ class NotificationTracker:
         asset: str,
         direction: str,
     ) -> None:
-        """Elimina lo stato salvato quando un setup termina o viene annullato."""
+        """Elimina completamente lo stato salvato di un setup."""
 
         setup_key = self._build_key(asset, direction)
 

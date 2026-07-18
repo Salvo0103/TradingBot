@@ -18,7 +18,7 @@ load_dotenv()
 
 app = FastAPI(
     title="TradingBot Webhook",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 decision_engine = DecisionEngine()
@@ -61,6 +61,10 @@ class TradingViewPayload(BaseModel):
     take_profit_1: float | None = None
     take_profit_2: float | None = None
 
+    # Gestione del ciclo di vita del setup.
+    setup_invalidated: bool = False
+    invalidation_reason: str | None = None
+
 
 def verify_secret(received_secret: str) -> None:
     """Verifica che il webhook provenga dalla nostra configurazione."""
@@ -83,7 +87,7 @@ def format_decision_message(
     context: MarketContext,
     decision,
 ) -> str:
-    """Crea il report Telegram completo."""
+    """Crea il report Telegram completo della decisione."""
 
     if decision.state == SetupState.CONFIRMED:
         title = (
@@ -145,6 +149,32 @@ def format_decision_message(
     return "\n".join(lines)
 
 
+def format_invalidation_message(
+    asset: str,
+    direction: str,
+    reason: str | None,
+) -> str:
+    """Crea il messaggio Telegram per un setup invalidato."""
+
+    invalidation_reason = (
+        reason.strip()
+        if reason and reason.strip()
+        else "Le condizioni del setup non sono più valide."
+    )
+
+    lines = [
+        f"❌ <b>{asset} — SETUP INVALIDATO</b>",
+        "",
+        f"<b>Direzione:</b> {direction}",
+        f"<b>Motivo:</b> {invalidation_reason}",
+        "",
+        "🔄 Il setup è stato chiuso dal tracker.",
+        "Un nuovo setup sullo stesso asset potrà essere notificato.",
+    ]
+
+    return "\n".join(lines)
+
+
 @app.get("/health")
 def health_check() -> dict:
     """Controllo rapido per verificare che il server sia online."""
@@ -161,8 +191,37 @@ def tradingview_webhook(payload: TradingViewPayload) -> dict:
 
     verify_secret(payload.secret)
 
+    asset = payload.asset.upper()
+    direction = payload.direction.upper()
+
+    # Se TradingView comunica l'invalidazione, chiudiamo il vecchio
+    # setup prima di effettuare una nuova valutazione.
+    if payload.setup_invalidated:
+        invalidation_sent = notification_tracker.invalidate_setup(
+            asset=asset,
+            direction=direction,
+        )
+
+        if invalidation_sent:
+            message = format_invalidation_message(
+                asset=asset,
+                direction=direction,
+                reason=payload.invalidation_reason,
+            )
+            TelegramSender().send_message(message)
+
+        return {
+            "ok": True,
+            "asset": asset,
+            "direction": direction,
+            "state": SetupState.INVALIDATED.value,
+            "notification_sent": invalidation_sent,
+            "duplicate_blocked": not invalidation_sent,
+            "tracker_reset": invalidation_sent,
+        }
+
     context = MarketContext(
-        asset=payload.asset.upper(),
+        asset=asset,
         direction=Direction(payload.direction),
         d1_bias=Direction(payload.d1_bias),
         h4_bias=Direction(payload.h4_bias),
@@ -222,4 +281,5 @@ def tradingview_webhook(payload: TradingViewPayload) -> dict:
         "score": decision.score,
         "notification_sent": notification_sent,
         "duplicate_blocked": duplicate_blocked,
+        "tracker_reset": False,
     }
