@@ -1,0 +1,259 @@
+//@version=6
+indicator("TradingBot Connector v1", overlay=true)
+
+// =====================================================
+// CONFIGURAZIONE
+// =====================================================
+
+webhookSecret = input.string(
+     "",
+     "Webhook Secret",
+     confirm=true
+)
+
+tradeDirection = input.string(
+     "LONG",
+     "Direzione da testare",
+     options=["LONG", "SHORT"]
+)
+
+riskReward = input.float(
+     3.0,
+     "Risk/Reward",
+     minval=0.0,
+     step=0.1
+)
+
+enableAlerts = input.bool(
+     false,
+     "Abilita alert di test"
+)
+
+// =====================================================
+// SESSIONI
+// Orari modificabili dalle impostazioni dell'indicatore
+// =====================================================
+
+londonSession = input.session(
+     "0800-1100",
+     "Sessione Londra"
+)
+
+newYorkSession = input.session(
+     "1430-1700",
+     "Sessione New York"
+)
+
+timezoneInput = input.string(
+     "Europe/Rome",
+     "Fuso orario"
+)
+
+inLondon = not na(
+     time(
+         timeframe.period,
+         londonSession,
+         timezoneInput
+     )
+)
+
+inNewYork = not na(
+     time(
+         timeframe.period,
+         newYorkSession,
+         timezoneInput
+     )
+)
+
+sessionName = inLondon
+     ? "london"
+     : inNewYork
+         ? "new_york"
+         : "outside_session"
+
+// =====================================================
+// TREND MULTI-TIMEFRAME PROVVISORIO
+// EMA 50 / EMA 200
+// In seguito verrà sostituito dal Market Builder completo.
+// =====================================================
+
+getBias() =>
+    emaFast = ta.ema(close, 50)
+    emaSlow = ta.ema(close, 200)
+
+    close > emaFast and emaFast > emaSlow
+         ? "LONG"
+         : close < emaFast and emaFast < emaSlow
+             ? "SHORT"
+             : "NEUTRAL"
+
+d1Bias = request.security(
+     syminfo.tickerid,
+     "D",
+     getBias(),
+     lookahead=barmerge.lookahead_off
+)
+
+h4Bias = request.security(
+     syminfo.tickerid,
+     "240",
+     getBias(),
+     lookahead=barmerge.lookahead_off
+)
+
+h1Bias = request.security(
+     syminfo.tickerid,
+     "60",
+     getBias(),
+     lookahead=barmerge.lookahead_off
+)
+
+// =====================================================
+// DATI DI TEST
+// Verranno sostituiti progressivamente dagli analyzer reali.
+// =====================================================
+
+poiReached = input.bool(
+     true,
+     "POI raggiunto"
+)
+
+liquiditySweep = input.bool(
+     true,
+     "Liquidity Sweep"
+)
+
+bosDetected = input.bool(
+     true,
+     "BOS"
+)
+
+chochDetected = input.bool(
+     false,
+     "CHoCH"
+)
+
+orderBlockDetected = input.bool(
+     true,
+     "Order Block"
+)
+
+fvgDetected = input.bool(
+     true,
+     "Fair Value Gap"
+)
+
+engulfingDetected = input.bool(
+     false,
+     "Engulfing"
+)
+
+rejectionDetected = input.bool(
+     false,
+     "Rejection Candle"
+)
+
+retestDetected = input.bool(
+     false,
+     "Retest"
+)
+
+// =====================================================
+// PREZZI INDICATIVI
+// =====================================================
+
+atr = ta.atr(14)
+
+longEntry = close
+longStop = close - atr
+longTp1 = close + atr * riskReward
+longTp2 = close + atr * (riskReward + 1.0)
+
+shortEntry = close
+shortStop = close + atr
+shortTp1 = close - atr * riskReward
+shortTp2 = close - atr * (riskReward + 1.0)
+
+entryPrice = tradeDirection == "LONG"
+     ? longEntry
+     : shortEntry
+
+stopPrice = tradeDirection == "LONG"
+     ? longStop
+     : shortStop
+
+tp1Price = tradeDirection == "LONG"
+     ? longTp1
+     : shortTp1
+
+tp2Price = tradeDirection == "LONG"
+     ? longTp2
+     : shortTp2
+
+// =====================================================
+// COSTRUZIONE JSON
+// =====================================================
+
+buildJson() =>
+    "{"
+     + "\"secret\":\"" + webhookSecret + "\","
+     + "\"asset\":\"" + syminfo.ticker + "\","
+     + "\"direction\":\"" + tradeDirection + "\","
+     + "\"d1_bias\":\"" + d1Bias + "\","
+     + "\"h4_bias\":\"" + h4Bias + "\","
+     + "\"h1_bias\":\"" + h1Bias + "\","
+     + "\"session_name\":\"" + sessionName + "\","
+     + "\"poi_reached\":" + str.tostring(poiReached) + ","
+     + "\"liquidity_sweep\":" + str.tostring(liquiditySweep) + ","
+     + "\"bos\":" + str.tostring(bosDetected) + ","
+     + "\"choch\":" + str.tostring(chochDetected) + ","
+     + "\"order_block\":" + str.tostring(orderBlockDetected) + ","
+     + "\"fair_value_gap\":" + str.tostring(fvgDetected) + ","
+     + "\"engulfing\":" + str.tostring(engulfingDetected) + ","
+     + "\"rejection_candle\":" + str.tostring(rejectionDetected) + ","
+     + "\"retest\":" + str.tostring(retestDetected) + ","
+     + "\"risk_reward\":" + str.tostring(riskReward) + ","
+     + "\"entry\":" + str.tostring(entryPrice) + ","
+     + "\"stop_loss\":" + str.tostring(stopPrice) + ","
+     + "\"take_profit_1\":" + str.tostring(tp1Price) + ","
+     + "\"take_profit_2\":" + str.tostring(tp2Price)
+     + "}"
+
+// =====================================================
+// ALERT
+// Una sola volta alla chiusura della candela.
+// =====================================================
+
+validSession = inLondon or inNewYork
+
+triggerAlert = (
+     enableAlerts
+     and validSession
+     and barstate.isconfirmed
+)
+
+if triggerAlert
+    alert(
+         buildJson(),
+         alert.freq_once_per_bar_close
+    )
+
+// =====================================================
+// ELEMENTI VISIVI
+// =====================================================
+
+bgcolor(
+     inLondon
+         ? color.new(color.blue, 90)
+         : inNewYork
+             ? color.new(color.orange, 90)
+             : na
+)
+
+plotshape(
+     triggerAlert,
+     title="Webhook inviato",
+     style=shape.labelup,
+     location=location.belowbar,
+     text="BOT"
+)

@@ -1,5 +1,6 @@
 """Gestione degli stati già notificati per evitare messaggi duplicati."""
 
+import os
 import sqlite3
 from pathlib import Path
 
@@ -41,15 +42,14 @@ class NotificationTracker:
         state: SetupState,
     ) -> bool:
         """
-        Restituisce True soltanto quando lo stato è diverso
-        dall'ultimo stato già notificato.
+        Restituisce True quando la notifica deve essere inviata.
 
-        Esempio:
-        ALMOST_READY → notifica
-        ALMOST_READY → bloccata
-        CONFIRMED → notifica
-        CONFIRMED → bloccata
+        In TEST_MODE=true permette anche notifiche duplicate.
+        In TEST_MODE=false mantiene il normale blocco duplicati.
         """
+
+        if self._test_mode_enabled():
+            return True
 
         setup_key = self._build_key(asset, direction)
 
@@ -76,15 +76,16 @@ class NotificationTracker:
         """
         Invalida un setup attivo.
 
-        Restituisce True soltanto se esisteva un setup precedentemente
-        notificato come ALMOST_READY oppure CONFIRMED.
-
-        Lo stato INVALIDATED funziona come confine tra il vecchio setup
-        e quello successivo:
-
-        - impedisce notifiche INVALIDATED duplicate;
-        - permette a un nuovo ALMOST_READY o CONFIRMED di essere notificato.
+        In TEST_MODE=true permette di testare anche invalidazioni ripetute.
+        In produzione invalida soltanto setup ALMOST_READY o CONFIRMED.
         """
+
+        if self._test_mode_enabled():
+            self._save_state(
+                setup_key=self._build_key(asset, direction),
+                state=SetupState.INVALIDATED,
+            )
+            return True
 
         previous_state = self.get_last_state(
             asset=asset,
@@ -171,3 +172,14 @@ class NotificationTracker:
     @staticmethod
     def _build_key(asset: str, direction: str) -> str:
         return f"{asset.upper()}:{direction.upper()}"
+
+    @staticmethod
+    def _test_mode_enabled() -> bool:
+        value = os.getenv("TEST_MODE", "false").strip().lower()
+
+        return value in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }

@@ -75,6 +75,9 @@ def verify_secret(received_secret: str) -> None:
         raise RuntimeError(
             "WEBHOOK_SECRET non configurato nel file .env."
         )
+    
+    print(f"Ricevuto: [{received_secret}]")
+    print(f"Atteso:    [{expected_secret}]")
 
     if not hmac.compare_digest(received_secret, expected_secret):
         raise HTTPException(
