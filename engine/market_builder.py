@@ -10,6 +10,7 @@ from analysis.premium_discount_analyzer import PremiumDiscountAnalyzer
 from analysis.structure_analyzer import StructureAnalyzer
 from analysis.trend_analyzer import TrendAnalyzer
 from engine.models import Direction, MarketContext
+from engine.setup_memory import SetupMemory
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class MarketBuilder:
         self.structure_analyzer = StructureAnalyzer()
         self.fvg_analyzer = FairValueGapAnalyzer()
         self.premium_discount_analyzer = PremiumDiscountAnalyzer()
+        self.setup_memory = SetupMemory()
 
     def build(
         self,
@@ -45,7 +47,7 @@ class MarketBuilder:
         take_profit_2: float | None = None,
         technical_zone_reached: bool = False,
     ) -> MarketContext:
-        """Analizza i timeframe e restituisce un MarketContext completo."""
+        """Analizza i DataFrame e restituisce un MarketContext completo."""
 
         d1_trend = self.trend_analyzer.analyze(data.d1)
         h4_trend = self.trend_analyzer.analyze(data.h4)
@@ -106,7 +108,7 @@ class MarketBuilder:
         notes.extend(fvg.reasons)
 
         return MarketContext(
-            asset=asset,
+            asset=asset.upper(),
             direction=direction,
             d1_bias=d1_trend.direction,
             h4_bias=h4_trend.direction,
@@ -127,6 +129,269 @@ class MarketBuilder:
             notes=notes,
         )
 
+    def build_from_payload(self, payload) -> MarketContext:
+        """Costruisce il MarketContext dai dati grezzi di TradingView."""
+
+        d1_bias = self._bias_from_timeframe(payload.d1)
+        h4_bias = self._bias_from_timeframe(payload.h4)
+        h1_bias = self._bias_from_timeframe(payload.h1)
+
+        direction = self._calculate_weighted_direction(
+            d1=d1_bias,
+            h4=h4_bias,
+            h1=h1_bias,
+        )
+
+        current = payload.current
+        previous_2 = payload.previous_2
+
+        bullish_sweep = (
+            payload.last_swing_low is not None
+            and current.low < payload.last_swing_low
+            and current.close > payload.last_swing_low
+        )
+
+        bearish_sweep = (
+            payload.last_swing_high is not None
+            and current.high > payload.last_swing_high
+            and current.close < payload.last_swing_high
+        )
+
+        current_sweep = (
+            bullish_sweep
+            if direction == Direction.LONG
+            else bearish_sweep
+            if direction == Direction.SHORT
+            else False
+        )
+
+        if current_sweep and direction != Direction.NEUTRAL:
+            self.setup_memory.register_sweep(
+                asset=payload.asset,
+                direction=direction.value,
+                timestamp=payload.timestamp,
+            )
+
+        if direction != Direction.NEUTRAL:
+            liquidity_sweep = self.setup_memory.has_recent_sweep(
+                asset=payload.asset,
+                direction=direction.value,
+                current_timestamp=payload.timestamp,
+            )
+        else:
+            liquidity_sweep = False
+
+        bullish_structure = False
+        bearish_structure = False
+
+        if (
+            payload.last_swing_high is not None
+            and payload.previous_swing_high is not None
+            and payload.last_swing_low is not None
+            and payload.previous_swing_low is not None
+        ):
+            bullish_structure = (
+                payload.last_swing_high > payload.previous_swing_high
+                and payload.last_swing_low > payload.previous_swing_low
+            )
+
+            bearish_structure = (
+                payload.last_swing_high < payload.previous_swing_high
+                and payload.last_swing_low < payload.previous_swing_low
+            )
+
+        broke_swing_high = (
+            payload.last_swing_high is not None
+            and current.close > payload.last_swing_high
+        )
+
+        broke_swing_low = (
+            payload.last_swing_low is not None
+            and current.close < payload.last_swing_low
+        )
+
+        bos = False
+        choch = False
+
+        if direction == Direction.LONG and broke_swing_high:
+            if bearish_structure:
+                choch = True
+            else:
+                bos = True
+
+        elif direction == Direction.SHORT and broke_swing_low:
+            if bullish_structure:
+                choch = True
+            else:
+                bos = True
+
+        bullish_fvg = current.low > previous_2.high
+        bearish_fvg = current.high < previous_2.low
+
+        fair_value_gap = (
+            bullish_fvg
+            if direction == Direction.LONG
+            else bearish_fvg
+            if direction == Direction.SHORT
+            else False
+        )
+
+        in_premium = False
+        in_discount = False
+
+        if (
+            payload.last_swing_high is not None
+            and payload.last_swing_low is not None
+        ):
+            midpoint = (
+                payload.last_swing_high
+                + payload.last_swing_low
+            ) / 2
+
+            in_premium = current.close > midpoint
+            in_discount = current.close < midpoint
+
+        poi_reached = (
+            fair_value_gap
+            or liquidity_sweep
+            or (
+                direction == Direction.LONG
+                and in_discount
+            )
+            or (
+                direction == Direction.SHORT
+                and in_premium
+            )
+        )
+
+        entry = current.close
+        stop_loss = None
+        take_profit_1 = None
+        take_profit_2 = None
+        risk_reward = None
+
+        if direction == Direction.LONG:
+            stop_loss = min(
+                current.low,
+                (
+                    payload.last_swing_low
+                    if payload.last_swing_low is not None
+                    else current.low
+                ),
+            )
+
+            risk = entry - stop_loss
+
+            if risk > 0:
+                risk_reward = 3.0
+                take_profit_1 = entry + risk * 2
+                take_profit_2 = entry + risk * 3
+
+        elif direction == Direction.SHORT:
+            stop_loss = max(
+                current.high,
+                (
+                    payload.last_swing_high
+                    if payload.last_swing_high is not None
+                    else current.high
+                ),
+            )
+
+            risk = stop_loss - entry
+
+            if risk > 0:
+                risk_reward = 3.0
+                take_profit_1 = entry - risk * 2
+                take_profit_2 = entry - risk * 3
+
+        notes = [
+            f"Bias D1: {d1_bias.value}",
+            f"Bias H4: {h4_bias.value}",
+            f"Bias H1: {h1_bias.value}",
+            f"Direzione ponderata: {direction.value}",
+            (
+                "Sweep rilevato sulla candela corrente"
+                if current_sweep
+                else "Nessuno sweep sulla candela corrente"
+            ),
+            (
+                "Sweep recente presente in memoria"
+                if liquidity_sweep
+                else "Nessuno sweep recente in memoria"
+            ),
+            (
+                "Struttura rialzista rilevata"
+                if bullish_structure
+                else "Struttura rialzista non rilevata"
+            ),
+            (
+                "Struttura ribassista rilevata"
+                if bearish_structure
+                else "Struttura ribassista non rilevata"
+            ),
+            "BOS rilevato" if bos else "BOS non rilevato",
+            "CHoCH rilevato" if choch else "CHoCH non rilevato",
+        ]
+
+        print("\n========== MARKET ==========")
+        print("Asset:", payload.asset)
+        print("Direction:", direction.value)
+        print("Current High:", current.high)
+        print("Current Low:", current.low)
+        print("Current Close:", current.close)
+        print("Last SH:", payload.last_swing_high)
+        print("Prev SH:", payload.previous_swing_high)
+        print("Last SL:", payload.last_swing_low)
+        print("Prev SL:", payload.previous_swing_low)
+        print("Break Swing High:", broke_swing_high)
+        print("Break Swing Low:", broke_swing_low)
+        print("Bullish structure:", bullish_structure)
+        print("Bearish structure:", bearish_structure)
+        print("BOS:", bos)
+        print("CHoCH:", choch)
+        print("============================\n")
+
+        return MarketContext(
+            asset=payload.asset.upper(),
+            direction=direction,
+            d1_bias=d1_bias,
+            h4_bias=h4_bias,
+            h1_bias=h1_bias,
+            in_premium=in_premium,
+            in_discount=in_discount,
+            poi_reached=poi_reached,
+            liquidity_sweep=liquidity_sweep,
+            bos=bos,
+            choch=choch,
+            fair_value_gap=fair_value_gap,
+            session_name=payload.session_name,
+            risk_reward=risk_reward,
+            entry=entry,
+            stop_loss=stop_loss,
+            take_profit_1=take_profit_1,
+            take_profit_2=take_profit_2,
+            notes=notes,
+        )
+
+    @staticmethod
+    def _bias_from_timeframe(timeframe_data) -> Direction:
+        """Calcola il trend usando prezzo, EMA50 ed EMA200."""
+
+        close = timeframe_data.candle.close
+        ema50 = timeframe_data.ema50
+        ema200 = timeframe_data.ema200
+
+        if ema50 is None or ema200 is None:
+            return Direction.NEUTRAL
+
+        if close > ema50 > ema200:
+            return Direction.LONG
+
+        if close < ema50 < ema200:
+            return Direction.SHORT
+
+        return Direction.NEUTRAL
+
     @staticmethod
     def _calculate_weighted_direction(
         d1: Direction,
@@ -134,7 +399,7 @@ class MarketBuilder:
         h1: Direction,
     ) -> Direction:
         """
-        Calcola il bias usando i pesi definitivi:
+        Calcola il bias usando i pesi definitivi.
 
         D1 = 20%
         H4 = 50%

@@ -12,7 +12,8 @@ from engine.decision_engine import DecisionEngine
 from engine.models import Direction, MarketContext, SetupState
 from engine.notification_tracker import NotificationTracker
 from notifications.telegram_sender import TelegramSender
-
+from engine.raw_market_data import TradingViewRawPayload
+from engine.market_builder import MarketBuilder
 
 load_dotenv()
 
@@ -23,6 +24,7 @@ app = FastAPI(
 
 decision_engine = DecisionEngine()
 notification_tracker = NotificationTracker()
+market_builder = MarketBuilder()
 
 
 class TradingViewPayload(BaseModel):
@@ -75,7 +77,7 @@ def verify_secret(received_secret: str) -> None:
         raise RuntimeError(
             "WEBHOOK_SECRET non configurato nel file .env."
         )
-    
+
     print(f"Ricevuto: [{received_secret}]")
     print(f"Atteso:    [{expected_secret}]")
 
@@ -86,18 +88,74 @@ def verify_secret(received_secret: str) -> None:
         )
 
 
+def format_session_name(session_name: str | None) -> str:
+    """Rende leggibile il nome della sessione."""
+
+    if not session_name:
+        return "Non disponibile"
+
+    normalized = session_name.strip().lower()
+
+    session_labels = {
+        "london": "Londra",
+        "new_york": "New York",
+    }
+
+    return session_labels.get(normalized, session_name)
+
+
+def format_price(asset: str, value: float | None) -> str | None:
+    """Formatta i prezzi in base al tipo di strumento."""
+
+    if value is None:
+        return None
+
+    normalized_asset = asset.upper().replace("/", "").replace("_", "")
+
+    if "JPY" in normalized_asset:
+        decimals = 3
+    elif any(
+        token in normalized_asset
+        for token in (
+            "GER40",
+            "DE40",
+            "DAX",
+            "US30",
+            "DJI",
+            "NAS100",
+            "USTEC",
+            "SPX500",
+            "US500",
+            "BTC",
+            "ETH",
+            "XAU",
+            "GOLD",
+            "XAG",
+            "SILVER",
+        )
+    ):
+        decimals = 2
+    else:
+        decimals = 5
+
+    return f"{value:.{decimals}f}"
+
+
 def format_decision_message(
     context: MarketContext,
     decision,
 ) -> str:
-    """Crea il report Telegram completo della decisione."""
+    """Crea il report Telegram della decisione."""
 
-    if decision.state == SetupState.CONFIRMED:
+    is_confirmed = decision.state == SetupState.CONFIRMED
+    is_almost_ready = decision.state == SetupState.ALMOST_READY
+
+    if is_confirmed:
         title = (
             f"🔴 <b>{context.asset} — "
             f"ENTRA {context.direction.value} ORA</b>"
         )
-    elif decision.state == SetupState.ALMOST_READY:
+    elif is_almost_ready:
         title = f"🟠 <b>{context.asset} — QUASI PRONTA</b>"
     else:
         title = f"🔵 <b>{context.asset} — NESSUN INGRESSO</b>"
@@ -107,26 +165,48 @@ def format_decision_message(
         "",
         f"<b>Qualità:</b> {decision.score:.1f}/100",
         f"<b>Direzione:</b> {context.direction.value}",
-        f"<b>Sessione:</b> {context.session_name}",
+        f"<b>Sessione:</b> {format_session_name(context.session_name)}",
     ]
 
-    if decision.risk_reward is not None:
-        lines.append(
-            f"<b>Rischio/Rendimento:</b> "
-            f"1:{decision.risk_reward:.2f}"
+    # I livelli operativi vengono mostrati solo quando il setup è confermato.
+    if is_confirmed:
+        if decision.risk_reward is not None:
+            lines.append(
+                f"<b>Rischio/Rendimento:</b> "
+                f"1:{decision.risk_reward:.2f}"
+            )
+
+        formatted_entry = format_price(context.asset, decision.entry)
+        formatted_stop_loss = format_price(
+            context.asset,
+            decision.stop_loss,
+        )
+        formatted_take_profit_1 = format_price(
+            context.asset,
+            decision.take_profit_1,
+        )
+        formatted_take_profit_2 = format_price(
+            context.asset,
+            decision.take_profit_2,
         )
 
-    if decision.entry is not None:
-        lines.append(f"<b>Entry:</b> {decision.entry}")
+        if formatted_entry is not None:
+            lines.append(f"<b>Entry:</b> {formatted_entry}")
 
-    if decision.stop_loss is not None:
-        lines.append(f"<b>Stop Loss:</b> {decision.stop_loss}")
+        if formatted_stop_loss is not None:
+            lines.append(
+                f"<b>Stop Loss:</b> {formatted_stop_loss}"
+            )
 
-    if decision.take_profit_1 is not None:
-        lines.append(f"<b>TP1:</b> {decision.take_profit_1}")
+        if formatted_take_profit_1 is not None:
+            lines.append(
+                f"<b>TP1:</b> {formatted_take_profit_1}"
+            )
 
-    if decision.take_profit_2 is not None:
-        lines.append(f"<b>TP2:</b> {decision.take_profit_2}")
+        if formatted_take_profit_2 is not None:
+            lines.append(
+                f"<b>TP2:</b> {formatted_take_profit_2}"
+            )
 
     if decision.reasons:
         lines.extend(["", "<b>Motivazione:</b>"])
@@ -143,7 +223,13 @@ def format_decision_message(
         )
 
     if decision.missing_elements:
-        lines.extend(["", "<b>Elementi mancanti:</b>"])
+        heading = (
+            "<b>Cosa manca:</b>"
+            if is_almost_ready
+            else "<b>Elementi mancanti:</b>"
+        )
+
+        lines.extend(["", heading])
         lines.extend(
             f"⏳ {element}"
             for element in decision.missing_elements
@@ -189,66 +275,43 @@ def health_check() -> dict:
 
 
 @app.post("/webhook/tradingview")
-def tradingview_webhook(payload: TradingViewPayload) -> dict:
-    """Riceve il contesto da TradingView e lo valuta."""
+def tradingview_webhook(payload: TradingViewRawPayload) -> dict:
+    """Riceve i dati grezzi da TradingView e li analizza."""
 
     verify_secret(payload.secret)
 
-    asset = payload.asset.upper()
-    direction = payload.direction.upper()
+    context = market_builder.build_from_payload(payload)
 
-    # Se TradingView comunica l'invalidazione, chiudiamo il vecchio
-    # setup prima di effettuare una nuova valutazione.
     if payload.setup_invalidated:
-        invalidation_sent = notification_tracker.invalidate_setup(
-            asset=asset,
-            direction=direction,
+        tracker_reset = notification_tracker.invalidate_setup(
+            asset=context.asset,
+            direction=context.direction.value,
         )
 
-        if invalidation_sent:
+        notification_sent = False
+
+        if tracker_reset:
             message = format_invalidation_message(
-                asset=asset,
-                direction=direction,
+                asset=context.asset,
+                direction=context.direction.value,
                 reason=payload.invalidation_reason,
             )
             TelegramSender().send_message(message)
+            notification_sent = True
 
         return {
             "ok": True,
-            "asset": asset,
-            "direction": direction,
+            "asset": context.asset,
+            "direction": context.direction.value,
+            "d1_bias": context.d1_bias.value,
+            "h4_bias": context.h4_bias.value,
+            "h1_bias": context.h1_bias.value,
             "state": SetupState.INVALIDATED.value,
-            "notification_sent": invalidation_sent,
-            "duplicate_blocked": not invalidation_sent,
-            "tracker_reset": invalidation_sent,
+            "score": 0.0,
+            "notification_sent": notification_sent,
+            "duplicate_blocked": not tracker_reset,
+            "tracker_reset": tracker_reset,
         }
-
-    context = MarketContext(
-        asset=asset,
-        direction=Direction(payload.direction),
-        d1_bias=Direction(payload.d1_bias),
-        h4_bias=Direction(payload.h4_bias),
-        h1_bias=Direction(payload.h1_bias),
-        in_premium=payload.in_premium,
-        in_discount=payload.in_discount,
-        poi_reached=payload.poi_reached,
-        liquidity_sweep=payload.liquidity_sweep,
-        bos=payload.bos,
-        choch=payload.choch,
-        order_block=payload.order_block,
-        fair_value_gap=payload.fair_value_gap,
-        imbalance=payload.imbalance,
-        smt=payload.smt,
-        engulfing=payload.engulfing,
-        rejection_candle=payload.rejection_candle,
-        retest=payload.retest,
-        session_name=payload.session_name,
-        risk_reward=payload.risk_reward,
-        entry=payload.entry,
-        stop_loss=payload.stop_loss,
-        take_profit_1=payload.take_profit_1,
-        take_profit_2=payload.take_profit_2,
-    )
 
     decision = decision_engine.evaluate(context)
 
@@ -280,6 +343,10 @@ def tradingview_webhook(payload: TradingViewPayload) -> dict:
     return {
         "ok": True,
         "asset": decision.asset,
+        "direction": context.direction.value,
+        "d1_bias": context.d1_bias.value,
+        "h4_bias": context.h4_bias.value,
+        "h1_bias": context.h1_bias.value,
         "state": decision.state.value,
         "score": decision.score,
         "notification_sent": notification_sent,

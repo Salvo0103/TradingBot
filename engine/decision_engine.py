@@ -8,6 +8,7 @@ from engine.models import (
 )
 
 MIN_RISK_REWARD = 2.0
+CONFIRMED_MIN_SCORE = 80.0
 VALID_SESSIONS = {"london", "new_york"}
 
 
@@ -48,12 +49,22 @@ class DecisionEngine:
             if not condition:
                 missing.append(label)
 
-        confirmed = all(mandatory_conditions.values())
+        all_mandatory_conditions_valid = all(
+            mandatory_conditions.values()
+        )
 
-        almost_ready = self._is_almost_ready(
-            context=context,
-            session_valid=session_valid,
-            risk_reward_valid=risk_reward_valid,
+        confirmed = (
+            all_mandatory_conditions_valid
+            and score >= CONFIRMED_MIN_SCORE
+        )
+
+        almost_ready = (
+            not confirmed
+            and self._is_almost_ready(
+                context=context,
+                session_valid=session_valid,
+                risk_reward_valid=risk_reward_valid,
+            )
         )
 
         if confirmed:
