@@ -1,6 +1,7 @@
 """Costruzione del MarketContext usando gli analyzer del TradingBot."""
 
 from dataclasses import dataclass
+from datetime import datetime, time
 
 import pandas as pd
 
@@ -9,6 +10,7 @@ from analysis.liquidity_analyzer import LiquidityAnalyzer
 from analysis.premium_discount_analyzer import PremiumDiscountAnalyzer
 from analysis.structure_analyzer import StructureAnalyzer
 from analysis.trend_analyzer import TrendAnalyzer
+from config.settings import TIMEZONE, TRADING_SESSIONS
 from engine.models import Direction, MarketContext
 from engine.setup_memory import SetupMemory
 
@@ -92,12 +94,19 @@ class MarketBuilder:
             or direction_consistent_fvg
         )
 
+        active_session = self._get_active_session()
+
         notes = [
             f"Bias D1: {d1_trend.direction.value}",
             f"Bias H4: {h4_trend.direction.value}",
             f"Bias H1: {h1_trend.direction.value}",
             f"Direzione ponderata: {direction.value}",
             f"Zona del range: {premium_discount.zone}",
+            (
+                f"Sessione operativa attiva: {active_session}"
+                if active_session
+                else "Fuori dalle finestre operative"
+            ),
         ]
 
         notes.extend(d1_trend.reasons)
@@ -120,7 +129,7 @@ class MarketBuilder:
             bos=structure.bos and direction_consistent_structure,
             choch=structure.choch and direction_consistent_structure,
             fair_value_gap=direction_consistent_fvg,
-            session_name=session_name,
+            session_name=active_session,
             risk_reward=risk_reward,
             entry=entry,
             stop_loss=stop_loss,
@@ -304,6 +313,9 @@ class MarketBuilder:
                 take_profit_1 = entry - risk * 2
                 take_profit_2 = entry - risk * 3
 
+        active_session = self._get_active_session()
+        current_time = datetime.now(TIMEZONE)
+
         notes = [
             f"Bias D1: {d1_bias.value}",
             f"Bias H4: {h4_bias.value}",
@@ -331,6 +343,12 @@ class MarketBuilder:
             ),
             "BOS rilevato" if bos else "BOS non rilevato",
             "CHoCH rilevato" if choch else "CHoCH non rilevato",
+            f"Ora italiana del controllo: {current_time:%H:%M:%S}",
+            (
+                f"Sessione operativa attiva: {active_session}"
+                if active_session
+                else "Fuori dalle finestre operative"
+            ),
         ]
 
         print("\n========== MARKET ==========")
@@ -349,6 +367,9 @@ class MarketBuilder:
         print("Bearish structure:", bearish_structure)
         print("BOS:", bos)
         print("CHoCH:", choch)
+        print("Ora italiana:", current_time.strftime("%H:%M:%S"))
+        print("Sessione ricevuta:", payload.session_name)
+        print("Sessione calcolata:", active_session)
         print("============================\n")
 
         return MarketContext(
@@ -364,7 +385,7 @@ class MarketBuilder:
             bos=bos,
             choch=choch,
             fair_value_gap=fair_value_gap,
-            session_name=payload.session_name,
+            session_name=active_session,
             risk_reward=risk_reward,
             entry=entry,
             stop_loss=stop_loss,
@@ -372,6 +393,47 @@ class MarketBuilder:
             take_profit_2=take_profit_2,
             notes=notes,
         )
+
+    @staticmethod
+    def _parse_session_time(value: str) -> time:
+        """Converte un orario HH:MM in un oggetto time."""
+
+        try:
+            return datetime.strptime(value, "%H:%M").time()
+        except ValueError as exc:
+            raise ValueError(
+                f"Orario di sessione non valido: {value!r}. "
+                "Usare il formato HH:MM."
+            ) from exc
+
+    @classmethod
+    def _get_active_session(cls) -> str | None:
+        """
+        Restituisce la sessione attiva usando l'ora italiana.
+
+        Finestre configurate:
+        - London: 08:00–12:40
+        - New York: 14:00–17:00
+
+        Fuori da queste fasce restituisce None.
+        """
+
+        current_time = datetime.now(TIMEZONE).time().replace(
+            tzinfo=None,
+        )
+
+        for session_name, session_config in TRADING_SESSIONS.items():
+            start_time = cls._parse_session_time(
+                session_config["start"],
+            )
+            end_time = cls._parse_session_time(
+                session_config["end"],
+            )
+
+            if start_time <= current_time <= end_time:
+                return session_name
+
+        return None
 
     @staticmethod
     def _bias_from_timeframe(timeframe_data) -> Direction:

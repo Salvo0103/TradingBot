@@ -39,11 +39,11 @@ TIMEFRAMES = {
 TRADING_SESSIONS = {
     "london": {
         "start": "08:00",
-        "end": "11:30",
+        "end": "12:40",
     },
     "new_york": {
-        "start": "14:30",
-        "end": "17:30",
+        "start": "14:00",
+        "end": "17:00",
     },
 }
 

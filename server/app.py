@@ -9,11 +9,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from engine.decision_engine import DecisionEngine
+from engine.market_builder import MarketBuilder
 from engine.models import Direction, MarketContext, SetupState
 from engine.notification_tracker import NotificationTracker
-from notifications.telegram_sender import TelegramSender
 from engine.raw_market_data import TradingViewRawPayload
-from engine.market_builder import MarketBuilder
+from notifications.telegram_sender import TelegramSender
 
 load_dotenv()
 
@@ -264,6 +264,108 @@ def format_invalidation_message(
     return "\n".join(lines)
 
 
+def send_telegram_message(message: str) -> bool:
+    """
+    Invia un messaggio Telegram e registra il risultato nel terminale.
+
+    Restituisce True se l'invio non genera errori.
+    """
+
+    try:
+        TelegramSender().send_message(message)
+        print("Telegram: messaggio inviato senza errori.")
+        return True
+    except Exception as exc:
+        print("Telegram: ERRORE durante l'invio.")
+        print(f"Tipo errore: {type(exc).__name__}")
+        print(f"Dettaglio: {exc}")
+        return False
+
+
+def print_decision_debug(
+    context: MarketContext,
+    decision,
+    should_notify: bool,
+    notification_sent: bool,
+    duplicate_blocked: bool,
+) -> None:
+    """Stampa nel terminale tutti i dettagli della decisione."""
+
+    print("\n========== DECISION ==========")
+    print("Asset:", context.asset)
+    print("Direzione:", context.direction.value)
+    print("Sessione:", context.session_name)
+    print("Stato:", decision.state.value)
+    print("Punteggio:", decision.score)
+    print("Setup valido:", decision.is_valid)
+    print(
+        "Stato notificabile:",
+        decision.state
+        in {
+            SetupState.ALMOST_READY,
+            SetupState.CONFIRMED,
+        },
+    )
+    print("Tracker autorizza notifica:", should_notify)
+    print("Notifica Telegram inviata:", notification_sent)
+    print("Duplicato bloccato:", duplicate_blocked)
+
+    if decision.risk_reward is not None:
+        print("Risk/Reward:", decision.risk_reward)
+    else:
+        print("Risk/Reward: non disponibile")
+
+    if decision.reasons:
+        print("\nMotivazioni presenti:")
+
+        for reason in decision.reasons:
+            print(f"  + {reason}")
+    else:
+        print("\nMotivazioni presenti: nessuna")
+
+    if decision.optional_confirmations:
+        print("\nConferme aggiuntive:")
+
+        for confirmation in decision.optional_confirmations:
+            print(f"  + {confirmation}")
+    else:
+        print("\nConferme aggiuntive: nessuna")
+
+    if decision.missing_elements:
+        print("\nElementi mancanti:")
+
+        for element in decision.missing_elements:
+            print(f"  - {element}")
+    else:
+        print("\nElementi mancanti: nessuno")
+
+    print("==============================\n")
+
+
+def print_invalidation_debug(
+    context: MarketContext,
+    tracker_reset: bool,
+    notification_sent: bool,
+    reason: str | None,
+) -> None:
+    """Stampa i dettagli relativi all'invalidazione del setup."""
+
+    invalidation_reason = (
+        reason.strip()
+        if reason and reason.strip()
+        else "Le condizioni del setup non sono più valide."
+    )
+
+    print("\n======= INVALIDATION =======")
+    print("Asset:", context.asset)
+    print("Direzione:", context.direction.value)
+    print("Motivo:", invalidation_reason)
+    print("Tracker resettato:", tracker_reset)
+    print("Notifica Telegram inviata:", notification_sent)
+    print("Duplicato bloccato:", not tracker_reset)
+    print("============================\n")
+
+
 @app.get("/health")
 def health_check() -> dict:
     """Controllo rapido per verificare che il server sia online."""
@@ -296,8 +398,20 @@ def tradingview_webhook(payload: TradingViewRawPayload) -> dict:
                 direction=context.direction.value,
                 reason=payload.invalidation_reason,
             )
-            TelegramSender().send_message(message)
-            notification_sent = True
+
+            notification_sent = send_telegram_message(message)
+        else:
+            print(
+                "Telegram: invalidazione non inviata perché "
+                "il setup era già stato chiuso."
+            )
+
+        print_invalidation_debug(
+            context=context,
+            tracker_reset=tracker_reset,
+            notification_sent=notification_sent,
+            reason=payload.invalidation_reason,
+        )
 
         return {
             "ok": True,
@@ -322,6 +436,7 @@ def tradingview_webhook(payload: TradingViewRawPayload) -> dict:
 
     notification_sent = False
     duplicate_blocked = False
+    should_notify = False
 
     if decision.state in notifiable_states:
         should_notify = notification_tracker.should_notify(
@@ -335,10 +450,28 @@ def tradingview_webhook(payload: TradingViewRawPayload) -> dict:
                 context=context,
                 decision=decision,
             )
-            TelegramSender().send_message(message)
-            notification_sent = True
+
+            notification_sent = send_telegram_message(message)
         else:
             duplicate_blocked = True
+
+            print(
+                "Telegram: notifica bloccata dal tracker "
+                "perché già inviata."
+            )
+    else:
+        print(
+            "Telegram: nessun invio perché lo stato "
+            f"{decision.state.value} non è notificabile."
+        )
+
+    print_decision_debug(
+        context=context,
+        decision=decision,
+        should_notify=should_notify,
+        notification_sent=notification_sent,
+        duplicate_blocked=duplicate_blocked,
+    )
 
     return {
         "ok": True,
